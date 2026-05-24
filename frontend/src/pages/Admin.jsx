@@ -1,9 +1,10 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef } from "react";
 import { api, formatApiError } from "../lib/api";
+import { uploadImage } from "../lib/supabase";
 import Navbar from "../components/Navbar";
 import Footer from "../components/Footer";
 import { toast } from "sonner";
-import { Trash2, Plus, Package, Users, Clock, Activity } from "lucide-react";
+import { Trash2, Plus, Package, Users, Clock, Activity, Upload, Loader2 } from "lucide-react";
 
 export default function Admin() {
     const [equipment, setEquipment] = useState([]);
@@ -13,6 +14,8 @@ export default function Admin() {
         name: "", category: "", description: "", image_url: "", specs: "", total_units: 1,
     });
     const [submitting, setSubmitting] = useState(false);
+    const [uploading, setUploading] = useState(false);
+    const fileInputRef = useRef(null);
 
     async function loadAll() {
         const [eq, ln] = await Promise.all([
@@ -27,6 +30,10 @@ export default function Admin() {
 
     async function addEquipment(e) {
         e.preventDefault();
+        if (!form.image_url) {
+            toast.error("Envie uma imagem antes de salvar");
+            return;
+        }
         setSubmitting(true);
         try {
             await api.post("/equipment", {
@@ -41,6 +48,22 @@ export default function Admin() {
             toast.error("Erro", { description: formatApiError(err) });
         } finally {
             setSubmitting(false);
+        }
+    }
+
+    async function handleFileUpload(e) {
+        const file = e.target.files?.[0];
+        if (!file) return;
+        setUploading(true);
+        try {
+            const { publicUrl } = await uploadImage(file, "equipment");
+            setForm((f) => ({ ...f, image_url: publicUrl }));
+            toast.success("Imagem enviada para o Supabase");
+        } catch (err) {
+            toast.error("Falha no upload", { description: err.message });
+        } finally {
+            setUploading(false);
+            if (fileInputRef.current) fileInputRef.current.value = "";
         }
     }
 
@@ -123,15 +146,43 @@ export default function Admin() {
                                 />
                             </div>
                             <div className="md:col-span-2">
-                                <label className="text-xs uppercase tracking-widest text-zinc-500 font-bold">URL da imagem</label>
+                                <label className="text-xs uppercase tracking-widest text-zinc-500 font-bold">Imagem (upload para Supabase)</label>
+                                <div className="mt-2 flex items-center gap-3">
+                                    <input
+                                        ref={fileInputRef}
+                                        data-testid="new-eq-image-file"
+                                        type="file"
+                                        accept="image/*"
+                                        onChange={handleFileUpload}
+                                        className="hidden"
+                                        id="image-file-input"
+                                    />
+                                    <label
+                                        htmlFor="image-file-input"
+                                        data-testid="new-eq-image-trigger"
+                                        className="btn-ghost cursor-pointer inline-flex items-center gap-2"
+                                    >
+                                        {uploading ? <Loader2 className="animate-spin" size={16} /> : <Upload size={16} />}
+                                        {uploading ? "Enviando..." : form.image_url ? "Trocar imagem" : "Selecionar imagem"}
+                                    </label>
+                                    {form.image_url && (
+                                        <img
+                                            src={form.image_url}
+                                            alt="preview"
+                                            data-testid="new-eq-image-preview"
+                                            className="w-16 h-16 object-cover border border-white/10"
+                                        />
+                                    )}
+                                </div>
+                                <p className="text-xs text-zinc-600 mt-2">
+                                    Bucket público "imagens" no Supabase Storage · Máx 5MB
+                                </p>
                                 <input
                                     data-testid="new-eq-image"
+                                    type="hidden"
                                     required
-                                    type="url"
                                     value={form.image_url}
                                     onChange={(e) => setForm({ ...form, image_url: e.target.value })}
-                                    className="fs-input mt-2 w-full px-4 py-3"
-                                    placeholder="https://..."
                                 />
                             </div>
                             <div>

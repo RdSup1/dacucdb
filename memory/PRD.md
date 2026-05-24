@@ -29,6 +29,7 @@ Design web de UI/UX para a plataforma de gerenciamento e empréstimo de equipame
 - [x] Imagens cinemáticas no hero + ilustrações de equipamentos
 - [x] 17/17 testes backend pytest passando
 - [x] Frontend e2e validado pelo testing agent
+- [x] **Supabase Storage** integrado: bucket público "imagens" criado automaticamente no startup, upload via backend (`POST /api/uploads/image`) usando service_role_key, frontend Admin com input file + preview, URL pública salva em `image_url`
 
 ## Backlog
 - P1: Notificações por email quando empréstimo é ativado (Resend/SendGrid)

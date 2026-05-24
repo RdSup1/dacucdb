@@ -12,11 +12,25 @@ import jwt
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional
 
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, status
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, status, UploadFile, File
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field, EmailStr, ConfigDict
+
+try:
+    from supabase import create_client as _supa_create_client
+except ImportError:
+    _supa_create_client = None
+
+
+def _supa_admin():
+    """Singleton Supabase admin client (service role)."""
+    url = os.environ.get("SUPABASE_URL")
+    key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+    if not url or not key or _supa_create_client is None:
+        return None
+    return _supa_create_client(url, key)
 
 
 # -----------------------
@@ -429,6 +443,43 @@ async def stats():
     }
 
 
+# -----------------------
+# Supabase Storage upload
+# -----------------------
+@api_router.post("/uploads/image")
+async def upload_image(
+    file: UploadFile = File(...),
+    folder: str = "equipment",
+    user: dict = Depends(get_current_user),
+):
+    """Upload de imagem para Supabase Storage bucket publico 'imagens'."""
+    sup = _supa_admin()
+    if sup is None:
+        raise HTTPException(status_code=503, detail="Supabase nao configurado")
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Apenas imagens sao permitidas")
+    data = await file.read()
+    if len(data) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Imagem maior que 5MB")
+    bucket = os.environ.get("SUPABASE_BUCKET", "imagens")
+    ext = (file.filename or "img").split(".")[-1].lower() if "." in (file.filename or "") else "jpg"
+    safe_folder = folder.replace("/", "_") or "misc"
+    path = f"{safe_folder}/{uuid.uuid4()}.{ext}"
+    try:
+        sup.storage.from_(bucket).upload(
+            path=path,
+            file=data,
+            file_options={"content-type": file.content_type, "upsert": "false"},
+        )
+        public_url = sup.storage.from_(bucket).get_public_url(path)
+    except Exception as e:
+        logger.error(f"Supabase upload error: {e}")
+        raise HTTPException(status_code=500, detail=f"Falha no upload: {e}")
+    return {"public_url": public_url, "path": path, "bucket": bucket}
+
+
+
+
 @api_router.get("/")
 async def root():
     return {"service": "Fomerstick API", "status": "ok"}
@@ -525,6 +576,37 @@ async def seed_equipment():
     logger.info(f"Seeded {len(SEED_EQUIPMENT)} equipment items")
 
 
+def ensure_supabase_bucket():
+    """Cria (se não existir) o bucket público de imagens no Supabase Storage."""
+    url = os.environ.get("SUPABASE_URL")
+    key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+    bucket = os.environ.get("SUPABASE_BUCKET", "imagens")
+    if not url or not key or _supa_create_client is None:
+        logger.info("Supabase nao configurado - pulando criacao de bucket")
+        return
+    try:
+        sclient = _supa_create_client(url, key)
+        buckets = sclient.storage.list_buckets()
+        names = []
+        for b in buckets:
+            n = getattr(b, "name", None)
+            if n is None and isinstance(b, dict):
+                n = b.get("name")
+            if n:
+                names.append(n)
+        if bucket in names:
+            logger.info(f"Supabase bucket '{bucket}' ja existe")
+            return
+        sclient.storage.create_bucket(
+            bucket,
+            options={"public": True, "file_size_limit": 5 * 1024 * 1024},
+        )
+        logger.info(f"Supabase bucket '{bucket}' criado (publico)")
+    except Exception as e:
+        logger.warning(f"Supabase bucket setup falhou: {e}")
+
+
+
 @app.on_event("startup")
 async def on_startup():
     try:
@@ -537,6 +619,7 @@ async def on_startup():
         logger.warning(f"Index creation issue: {e}")
     await seed_admin()
     await seed_equipment()
+    ensure_supabase_bucket()
 
 
 @app.on_event("shutdown")
