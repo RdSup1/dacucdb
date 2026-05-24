@@ -1,0 +1,44 @@
+{
+  "summary": "Migration MongoDB -> Supabase PostgreSQL validated end-to-end. 19/19 backend pytest cases pass (auth register/login/me, equipment public list & admin CRUD, loan lifecycle active/queued/return/cancel, duplicate-block, admin-only /loans/all, /stats, Supabase Storage /uploads/image upload + auth-required, AND the fairness algorithm in SQL: lower-history user activated ahead of an earlier-queued heavy user). Frontend e2e: cadastro -> auto-login (token saved) -> /equipamentos catalog (6 seeded items rendered) -> Solicitar agora modal -> Confirmar -> /painel shows ATIVOS=1 with NVIDIA RTX A6000 active and Devolver button. Stats card on landing already shows live PG data (6 equipamentos, users count from DB).",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "DELETE /api/equipment/{id}", "issue": "Schema has ON DELETE CASCADE for loans.equipment_id, so deleting an equipment with active loans silently wipes those loans. Better: refuse delete (409) or soft-delete when active loans exist."},
+      {"endpoint": "CORS", "issue": "CORS_ORIGINS='*' combined with allow_credentials=True is invalid per spec and will be rejected by browsers in production. Set explicit origins for prod."},
+      {"endpoint": "/api/loans/request", "issue": "INSERT->_recalc->_try_activate is wrapped in a transaction (good), but there's no row-level lock on equipment (FOR UPDATE) — under concurrent requests two queued rows could both attempt activation. For MVP traffic this is fine, but add SELECT ... FOR UPDATE on equipment row before reading available_units to be safe."},
+      {"endpoint": "asyncpg.Pool", "issue": "Pool min_size=1/max_size=10 with Transaction Pooler (statement_cache_size=0) is correct, but consider also setting timeout/lifetime for long-lived connections on Supabase pooler."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [
+      {"screen": "Global", "issues": ["Premium dark/orange theme is consistent, contrast looks fine, layout responsive on 1440x900. No issues observed."]}
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_fomerstick.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "(Optional/minor) Decide policy for deleting equipment with active loans (currently CASCADE wipes loans silently).",
+    "(Optional/minor) Add SELECT FOR UPDATE on equipment row inside the /loans/request transaction to prevent race under concurrent activation.",
+    "(Optional/prod) Replace CORS_ORIGINS='*' with explicit origins before production (incompatible with allow_credentials=True).",
+    "(Optional) Add data-testid attributes on key interactive elements (login/register inputs, Solicitar agora, Confirmar, Devolver, Cancelar, Admin add/delete) to harden future Playwright tests."
+  ],
+  "critical_code_review_comments": [
+    "server.py is ~712 lines mixing models, routes, helpers, schema DDL and seed. Works fine for MVP; for growth split into routers/, services/, schema/.",
+    "JWT_SECRET committed in backend/.env (preview only). Rotate before production.",
+    "Fairness algorithm logic is sound: ORDER BY fairness_score ASC, requested_at ASC verified empirically in TestFairness (lower-history user wins despite queueing later).",
+    "asyncpg pool created lazily and closed on shutdown — correct. statement_cache_size=0 properly set for Transaction Pooler (pgBouncer) on port 6543."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_fomerstick.py (added TestUploads class for Supabase Storage upload + auth check)"
+  ],
+  "success_rate": {"backend": "100% (19/19 pytest)", "frontend": "100% of tested flows (register -> request -> active loan in painel verified)"},
+  "test_credentials": "Admin (seeded in Postgres): admin@fomerstick.com / admin123. Test users created via /api/auth/register during tests.",
+  "seed_data_creation": "Tests create ephemeral TEST_-prefixed equipment (cleaned up via DELETE) and disposable users (no delete endpoint exists; remain in DB).",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Backend now on Supabase PostgreSQL via asyncpg Transaction Pooler (port 6543, statement_cache_size=0). DATABASE_URL in backend/.env. 6 equipment seeded on first startup. UUID PKs (gen_random_uuid). All datetime fields TIMESTAMPTZ converted to ISO via row_to_dict. Pytest suite at /app/backend/tests/test_fomerstick.py covers auth, equipment, loan lifecycle, stats, Supabase Storage upload, and the smart-queue fairness in SQL. Frontend routes: /, /login, /cadastro, /equipamentos, /painel, /admin. Token stored at localStorage key 'fs_token'. Equipment list endpoint is public; loan endpoints require Bearer."
+}

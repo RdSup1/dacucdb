@@ -200,6 +200,35 @@ class TestLoans:
         assert r2.status_code == 403
 
 
+# ---- Upload (Supabase Storage) ----
+class TestUploads:
+    def test_upload_image_authenticated(self, session, admin_token):
+        import io
+        # 1x1 PNG bytes
+        png = bytes.fromhex(
+            "89504E470D0A1A0A0000000D49484452000000010000000108060000001F15C489"
+            "0000000A49444154789C636000000000050001A5F645400000000049454E44AE426082"
+        )
+        files = {"file": ("test.png", io.BytesIO(png), "image/png")}
+        r = requests.post(
+            f"{API}/uploads/image",
+            files=files,
+            headers={"Authorization": f"Bearer {admin_token}"},
+            params={"folder": "test"},
+            timeout=30,
+        )
+        assert r.status_code == 200, f"upload failed: {r.status_code} {r.text}"
+        d = r.json()
+        assert "public_url" in d and d["public_url"].startswith("http")
+        assert d.get("bucket") == "imagens"
+
+    def test_upload_requires_auth(self, session):
+        import io
+        files = {"file": ("test.png", io.BytesIO(b"x"), "image/png")}
+        r = requests.post(f"{API}/uploads/image", files=files, timeout=15)
+        assert r.status_code == 401
+
+
 # ---- Stats ----
 class TestStats:
     def test_stats(self, session):

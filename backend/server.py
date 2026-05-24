@@ -9,13 +9,13 @@ import logging
 import uuid
 import bcrypt
 import jwt
+import asyncpg
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional
 
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, status, UploadFile, File
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, UploadFile, File
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field, EmailStr, ConfigDict
 
 try:
@@ -24,22 +24,10 @@ except ImportError:
     _supa_create_client = None
 
 
-def _supa_admin():
-    """Singleton Supabase admin client (service role)."""
-    url = os.environ.get("SUPABASE_URL")
-    key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-    if not url or not key or _supa_create_client is None:
-        return None
-    return _supa_create_client(url, key)
-
-
 # -----------------------
-# Config & DB
+# Config & DB Pool (Supabase PostgreSQL via Transaction Pooler)
 # -----------------------
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
-
+DATABASE_URL = os.environ['DATABASE_URL']
 JWT_SECRET = os.environ['JWT_SECRET']
 JWT_ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_HOURS = 24
@@ -47,9 +35,33 @@ ACCESS_TOKEN_EXPIRE_HOURS = 24
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Fomerstick API")
+app = FastAPI(title="Fomerstick API (Supabase)")
 api_router = APIRouter(prefix="/api")
 security = HTTPBearer(auto_error=False)
+
+pool: Optional[asyncpg.Pool] = None
+
+
+async def get_pool() -> asyncpg.Pool:
+    global pool
+    if pool is None:
+        # statement_cache_size=0 é necessário com Transaction Pooler (pgBouncer)
+        pool = await asyncpg.create_pool(
+            DATABASE_URL,
+            min_size=1,
+            max_size=10,
+            statement_cache_size=0,
+            command_timeout=30,
+        )
+    return pool
+
+
+def _supa_admin():
+    url = os.environ.get("SUPABASE_URL")
+    key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+    if not url or not key or _supa_create_client is None:
+        return None
+    return _supa_create_client(url, key)
 
 
 # -----------------------
@@ -77,6 +89,19 @@ def create_access_token(user_id: str, email: str, role: str) -> str:
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
 
+def row_to_dict(row) -> dict:
+    """Converte asyncpg.Record para dict com datetimes em ISO."""
+    if row is None:
+        return None
+    d = dict(row)
+    for k, v in d.items():
+        if isinstance(v, datetime):
+            d[k] = v.isoformat()
+        elif isinstance(v, uuid.UUID):
+            d[k] = str(v)
+    return d
+
+
 async def get_current_user(
     request: Request,
     creds: Optional[HTTPAuthorizationCredentials] = Depends(security),
@@ -92,10 +117,15 @@ async def get_current_user(
         raise HTTPException(status_code=401, detail="Not authenticated")
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        user = await db.users.find_one({"id": payload["sub"]}, {"_id": 0, "password_hash": 0})
-        if not user:
+        p = await get_pool()
+        async with p.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT id, email, name, role, created_at FROM users WHERE id = $1",
+                uuid.UUID(payload["sub"]),
+            )
+        if not row:
             raise HTTPException(status_code=401, detail="User not found")
-        return user
+        return row_to_dict(row)
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
     except jwt.InvalidTokenError:
@@ -108,12 +138,8 @@ async def require_admin(user: dict = Depends(get_current_user)) -> dict:
     return user
 
 
-def utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
 # -----------------------
-# Models
+# Pydantic Models
 # -----------------------
 class RegisterIn(BaseModel):
     email: EmailStr
@@ -177,7 +203,7 @@ class LoanOut(BaseModel):
     equipment_id: str
     equipment_name: str
     equipment_image: str
-    status: str  # queued | active | returned | cancelled
+    status: str
     queue_position: Optional[int] = None
     requested_at: str
     activated_at: Optional[str] = None
@@ -188,45 +214,92 @@ class LoanOut(BaseModel):
 
 
 # -----------------------
-# Auth Endpoints
+# Schema (DDL) — executed on startup
+# -----------------------
+SCHEMA_SQL = """
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+CREATE TABLE IF NOT EXISTS users (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    email         TEXT UNIQUE NOT NULL,
+    name          TEXT NOT NULL,
+    password_hash TEXT NOT NULL,
+    role          TEXT NOT NULL DEFAULT 'user',
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS equipment (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name            TEXT NOT NULL,
+    category        TEXT NOT NULL,
+    description     TEXT NOT NULL,
+    image_url       TEXT NOT NULL,
+    specs           TEXT NOT NULL DEFAULT '',
+    total_units     INT  NOT NULL DEFAULT 1,
+    available_units INT  NOT NULL DEFAULT 1,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS loans (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id         UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    equipment_id    UUID NOT NULL REFERENCES equipment(id) ON DELETE CASCADE,
+    user_name       TEXT NOT NULL,
+    user_email      TEXT NOT NULL,
+    equipment_name  TEXT NOT NULL,
+    equipment_image TEXT NOT NULL,
+    status          TEXT NOT NULL,
+    queue_position  INT,
+    requested_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    activated_at    TIMESTAMPTZ,
+    returned_at     TIMESTAMPTZ,
+    due_date        TIMESTAMPTZ,
+    requested_days  INT NOT NULL DEFAULT 7,
+    notes           TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_loans_eq_status ON loans(equipment_id, status);
+CREATE INDEX IF NOT EXISTS idx_loans_user      ON loans(user_id);
+"""
+
+
+# -----------------------
+# Auth endpoints
 # -----------------------
 @api_router.post("/auth/register", response_model=AuthOut)
 async def register(payload: RegisterIn):
     email = payload.email.lower().strip()
-    existing = await db.users.find_one({"email": email})
-    if existing:
-        raise HTTPException(status_code=400, detail="Email já cadastrado")
-    user_id = str(uuid.uuid4())
-    doc = {
-        "id": user_id,
-        "email": email,
-        "name": payload.name.strip(),
-        "password_hash": hash_password(payload.password),
-        "role": "user",
-        "created_at": utc_iso(),
-    }
-    await db.users.insert_one(doc)
-    token = create_access_token(user_id, email, "user")
-    return AuthOut(
-        user=UserOut(id=user_id, email=email, name=doc["name"], role="user", created_at=doc["created_at"]),
-        access_token=token,
-    )
+    p = await get_pool()
+    async with p.acquire() as conn:
+        existing = await conn.fetchval("SELECT id FROM users WHERE email = $1", email)
+        if existing:
+            raise HTTPException(status_code=400, detail="Email já cadastrado")
+        row = await conn.fetchrow(
+            """INSERT INTO users (email, name, password_hash, role)
+               VALUES ($1, $2, $3, 'user')
+               RETURNING id, email, name, role, created_at""",
+            email, payload.name.strip(), hash_password(payload.password),
+        )
+    user = row_to_dict(row)
+    token = create_access_token(user["id"], user["email"], user["role"])
+    return AuthOut(user=UserOut(**user), access_token=token)
 
 
 @api_router.post("/auth/login", response_model=AuthOut)
 async def login(payload: LoginIn):
     email = payload.email.lower().strip()
-    user = await db.users.find_one({"email": email})
-    if not user or not verify_password(payload.password, user["password_hash"]):
+    p = await get_pool()
+    async with p.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, email, name, role, password_hash, created_at FROM users WHERE email = $1",
+            email,
+        )
+    if not row or not verify_password(payload.password, row["password_hash"]):
         raise HTTPException(status_code=401, detail="Credenciais inválidas")
+    user = row_to_dict(row)
+    user.pop("password_hash", None)
     token = create_access_token(user["id"], user["email"], user["role"])
-    return AuthOut(
-        user=UserOut(
-            id=user["id"], email=user["email"], name=user["name"],
-            role=user["role"], created_at=user["created_at"],
-        ),
-        access_token=token,
-    )
+    return AuthOut(user=UserOut(**user), access_token=token)
 
 
 @api_router.get("/auth/me", response_model=UserOut)
@@ -235,209 +308,224 @@ async def me(user: dict = Depends(get_current_user)):
 
 
 # -----------------------
-# Equipment Endpoints
+# Equipment endpoints
 # -----------------------
 @api_router.get("/equipment", response_model=List[EquipmentOut])
 async def list_equipment():
-    items = await db.equipment.find({}, {"_id": 0}).sort("created_at", -1).to_list(500)
-    return [EquipmentOut(**item) for item in items]
+    p = await get_pool()
+    async with p.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM equipment ORDER BY created_at DESC"
+        )
+    return [EquipmentOut(**row_to_dict(r)) for r in rows]
 
 
 @api_router.get("/equipment/{equipment_id}", response_model=EquipmentOut)
 async def get_equipment(equipment_id: str):
-    item = await db.equipment.find_one({"id": equipment_id}, {"_id": 0})
-    if not item:
+    p = await get_pool()
+    async with p.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM equipment WHERE id = $1", uuid.UUID(equipment_id))
+    if not row:
         raise HTTPException(status_code=404, detail="Equipamento não encontrado")
-    return EquipmentOut(**item)
+    return EquipmentOut(**row_to_dict(row))
 
 
 @api_router.post("/equipment", response_model=EquipmentOut)
 async def create_equipment(payload: EquipmentIn, admin: dict = Depends(require_admin)):
-    eq_id = str(uuid.uuid4())
-    doc = {
-        "id": eq_id,
-        "name": payload.name,
-        "category": payload.category,
-        "description": payload.description,
-        "image_url": payload.image_url,
-        "specs": payload.specs or "",
-        "total_units": payload.total_units,
-        "available_units": payload.total_units,
-        "created_at": utc_iso(),
-    }
-    await db.equipment.insert_one(doc)
-    return EquipmentOut(**doc)
+    p = await get_pool()
+    async with p.acquire() as conn:
+        row = await conn.fetchrow(
+            """INSERT INTO equipment (name, category, description, image_url, specs, total_units, available_units)
+               VALUES ($1, $2, $3, $4, $5, $6, $6)
+               RETURNING *""",
+            payload.name, payload.category, payload.description,
+            payload.image_url, payload.specs or "", payload.total_units,
+        )
+    return EquipmentOut(**row_to_dict(row))
 
 
 @api_router.delete("/equipment/{equipment_id}")
 async def delete_equipment(equipment_id: str, admin: dict = Depends(require_admin)):
-    res = await db.equipment.delete_one({"id": equipment_id})
-    if res.deleted_count == 0:
+    p = await get_pool()
+    async with p.acquire() as conn:
+        res = await conn.execute("DELETE FROM equipment WHERE id = $1", uuid.UUID(equipment_id))
+    if res.endswith(" 0"):
         raise HTTPException(status_code=404, detail="Equipamento não encontrado")
-    await db.loans.delete_many({"equipment_id": equipment_id, "status": {"$in": ["queued"]}})
     return {"deleted": True}
 
 
 # -----------------------
 # Loans / Smart Queue
 # -----------------------
-async def _recalc_queue_positions(equipment_id: str):
-    queued = await db.loans.find(
-        {"equipment_id": equipment_id, "status": "queued"}
-    ).sort("requested_at", 1).to_list(1000)
-    for idx, loan in enumerate(queued):
-        await db.loans.update_one({"id": loan["id"]}, {"$set": {"queue_position": idx + 1}})
+async def _recalc_queue_positions(conn, equipment_id: uuid.UUID):
+    """Reposiciona números da fila (1, 2, 3...) ordenando por requested_at."""
+    await conn.execute("""
+        WITH ordered AS (
+            SELECT id, ROW_NUMBER() OVER (ORDER BY requested_at ASC) AS pos
+            FROM loans
+            WHERE equipment_id = $1 AND status = 'queued'
+        )
+        UPDATE loans SET queue_position = ordered.pos
+        FROM ordered WHERE loans.id = ordered.id
+    """, equipment_id)
 
 
-async def _user_fairness_score(user_id: str) -> int:
-    """Lower is fairer. Counts user's active + returned loans in last 30 days."""
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
-    count = await db.loans.count_documents({
-        "user_id": user_id,
-        "status": {"$in": ["active", "returned"]},
-        "requested_at": {"$gte": cutoff},
-    })
-    return count
+async def _user_fairness_score(conn, user_id: uuid.UUID) -> int:
+    """Quantos empréstimos o usuário usou nos últimos 30 dias. Menor = mais prioridade."""
+    return await conn.fetchval("""
+        SELECT COUNT(*) FROM loans
+        WHERE user_id = $1
+          AND status IN ('active', 'returned')
+          AND requested_at >= NOW() - INTERVAL '30 days'
+    """, user_id)
 
 
-async def _try_activate_next(equipment_id: str):
-    eq = await db.equipment.find_one({"id": equipment_id})
+async def _try_activate_next(conn, equipment_id: uuid.UUID):
+    """Algoritmo de Equidade: ativa o próximo da fila com menor fairness score."""
+    eq = await conn.fetchrow(
+        "SELECT available_units FROM equipment WHERE id = $1", equipment_id,
+    )
     if not eq or eq["available_units"] <= 0:
         return
-    queued = await db.loans.find(
-        {"equipment_id": equipment_id, "status": "queued"}
-    ).to_list(1000)
+    queued = await conn.fetch(
+        "SELECT id, user_id, requested_days, requested_at FROM loans "
+        "WHERE equipment_id = $1 AND status = 'queued'",
+        equipment_id,
+    )
     if not queued:
         return
-    # Smart Queue: equidade — usuário com menor score tem prioridade, empate por requested_at
     scored = []
     for loan in queued:
-        s = await _user_fairness_score(loan["user_id"])
+        s = await _user_fairness_score(conn, loan["user_id"])
         scored.append((s, loan["requested_at"], loan))
     scored.sort(key=lambda x: (x[0], x[1]))
     next_loan = scored[0][2]
-    activated_at = utc_iso()
-    due = (datetime.now(timezone.utc) + timedelta(days=next_loan["requested_days"])).isoformat()
-    await db.loans.update_one(
-        {"id": next_loan["id"]},
-        {"$set": {
-            "status": "active",
-            "activated_at": activated_at,
-            "due_date": due,
-            "queue_position": None,
-        }},
+    await conn.execute("""
+        UPDATE loans SET
+            status = 'active',
+            activated_at = NOW(),
+            due_date = NOW() + ($1 * INTERVAL '1 day'),
+            queue_position = NULL
+        WHERE id = $2
+    """, next_loan["requested_days"], next_loan["id"])
+    await conn.execute(
+        "UPDATE equipment SET available_units = available_units - 1 WHERE id = $1",
+        equipment_id,
     )
-    await db.equipment.update_one(
-        {"id": equipment_id},
-        {"$inc": {"available_units": -1}},
-    )
-    await _recalc_queue_positions(equipment_id)
+    await _recalc_queue_positions(conn, equipment_id)
 
 
 @api_router.post("/loans/request", response_model=LoanOut)
 async def request_loan(payload: LoanRequestIn, user: dict = Depends(get_current_user)):
-    eq = await db.equipment.find_one({"id": payload.equipment_id}, {"_id": 0})
-    if not eq:
-        raise HTTPException(status_code=404, detail="Equipamento não encontrado")
-    # Don't allow double active/queued for same equipment
-    existing = await db.loans.find_one({
-        "user_id": user["id"],
-        "equipment_id": payload.equipment_id,
-        "status": {"$in": ["queued", "active"]},
-    })
-    if existing:
-        raise HTTPException(status_code=400, detail="Você já possui solicitação ativa para este equipamento")
-
-    loan_id = str(uuid.uuid4())
-    doc = {
-        "id": loan_id,
-        "user_id": user["id"],
-        "user_name": user["name"],
-        "user_email": user["email"],
-        "equipment_id": eq["id"],
-        "equipment_name": eq["name"],
-        "equipment_image": eq["image_url"],
-        "status": "queued",
-        "queue_position": None,
-        "requested_at": utc_iso(),
-        "activated_at": None,
-        "returned_at": None,
-        "due_date": None,
-        "requested_days": payload.requested_days,
-        "notes": payload.notes or "",
-    }
-    await db.loans.insert_one(doc)
-    await _recalc_queue_positions(eq["id"])
-    await _try_activate_next(eq["id"])
-
-    final_doc = await db.loans.find_one({"id": loan_id}, {"_id": 0})
-    return LoanOut(**final_doc)
+    eq_id = uuid.UUID(payload.equipment_id)
+    user_id = uuid.UUID(user["id"])
+    p = await get_pool()
+    async with p.acquire() as conn:
+        async with conn.transaction():
+            eq = await conn.fetchrow(
+                "SELECT id, name, image_url FROM equipment WHERE id = $1", eq_id,
+            )
+            if not eq:
+                raise HTTPException(status_code=404, detail="Equipamento não encontrado")
+            dup = await conn.fetchval(
+                "SELECT id FROM loans WHERE user_id = $1 AND equipment_id = $2 "
+                "AND status IN ('queued', 'active')",
+                user_id, eq_id,
+            )
+            if dup:
+                raise HTTPException(status_code=400, detail="Você já possui solicitação ativa para este equipamento")
+            row = await conn.fetchrow("""
+                INSERT INTO loans (
+                    user_id, equipment_id, user_name, user_email,
+                    equipment_name, equipment_image, status, requested_days, notes
+                ) VALUES ($1, $2, $3, $4, $5, $6, 'queued', $7, $8)
+                RETURNING id
+            """, user_id, eq_id, user["name"], user["email"],
+                 eq["name"], eq["image_url"], payload.requested_days, payload.notes or "")
+            await _recalc_queue_positions(conn, eq_id)
+            await _try_activate_next(conn, eq_id)
+            final = await conn.fetchrow("SELECT * FROM loans WHERE id = $1", row["id"])
+    return LoanOut(**row_to_dict(final))
 
 
 @api_router.get("/loans/mine", response_model=List[LoanOut])
 async def my_loans(user: dict = Depends(get_current_user)):
-    items = await db.loans.find({"user_id": user["id"]}, {"_id": 0}).sort("requested_at", -1).to_list(500)
-    return [LoanOut(**i) for i in items]
+    p = await get_pool()
+    async with p.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM loans WHERE user_id = $1 ORDER BY requested_at DESC",
+            uuid.UUID(user["id"]),
+        )
+    return [LoanOut(**row_to_dict(r)) for r in rows]
 
 
 @api_router.post("/loans/{loan_id}/return", response_model=LoanOut)
 async def return_loan(loan_id: str, user: dict = Depends(get_current_user)):
-    loan = await db.loans.find_one({"id": loan_id}, {"_id": 0})
-    if not loan:
-        raise HTTPException(status_code=404, detail="Empréstimo não encontrado")
-    if loan["user_id"] != user["id"] and user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Sem permissão")
-    if loan["status"] != "active":
-        raise HTTPException(status_code=400, detail="Empréstimo não está ativo")
-    await db.loans.update_one(
-        {"id": loan_id},
-        {"$set": {"status": "returned", "returned_at": utc_iso()}},
-    )
-    await db.equipment.update_one(
-        {"id": loan["equipment_id"]},
-        {"$inc": {"available_units": 1}},
-    )
-    await _try_activate_next(loan["equipment_id"])
-    final = await db.loans.find_one({"id": loan_id}, {"_id": 0})
-    return LoanOut(**final)
+    p = await get_pool()
+    async with p.acquire() as conn:
+        async with conn.transaction():
+            loan = await conn.fetchrow("SELECT * FROM loans WHERE id = $1", uuid.UUID(loan_id))
+            if not loan:
+                raise HTTPException(status_code=404, detail="Empréstimo não encontrado")
+            if str(loan["user_id"]) != user["id"] and user.get("role") != "admin":
+                raise HTTPException(status_code=403, detail="Sem permissão")
+            if loan["status"] != "active":
+                raise HTTPException(status_code=400, detail="Empréstimo não está ativo")
+            await conn.execute(
+                "UPDATE loans SET status = 'returned', returned_at = NOW() WHERE id = $1",
+                uuid.UUID(loan_id),
+            )
+            await conn.execute(
+                "UPDATE equipment SET available_units = available_units + 1 WHERE id = $1",
+                loan["equipment_id"],
+            )
+            await _try_activate_next(conn, loan["equipment_id"])
+            final = await conn.fetchrow("SELECT * FROM loans WHERE id = $1", uuid.UUID(loan_id))
+    return LoanOut(**row_to_dict(final))
 
 
 @api_router.post("/loans/{loan_id}/cancel", response_model=LoanOut)
 async def cancel_loan(loan_id: str, user: dict = Depends(get_current_user)):
-    loan = await db.loans.find_one({"id": loan_id}, {"_id": 0})
-    if not loan:
-        raise HTTPException(status_code=404, detail="Empréstimo não encontrado")
-    if loan["user_id"] != user["id"] and user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Sem permissão")
-    if loan["status"] != "queued":
-        raise HTTPException(status_code=400, detail="Só é possível cancelar solicitações na fila")
-    await db.loans.update_one(
-        {"id": loan_id},
-        {"$set": {"status": "cancelled"}},
-    )
-    await _recalc_queue_positions(loan["equipment_id"])
-    final = await db.loans.find_one({"id": loan_id}, {"_id": 0})
-    return LoanOut(**final)
+    p = await get_pool()
+    async with p.acquire() as conn:
+        async with conn.transaction():
+            loan = await conn.fetchrow("SELECT * FROM loans WHERE id = $1", uuid.UUID(loan_id))
+            if not loan:
+                raise HTTPException(status_code=404, detail="Empréstimo não encontrado")
+            if str(loan["user_id"]) != user["id"] and user.get("role") != "admin":
+                raise HTTPException(status_code=403, detail="Sem permissão")
+            if loan["status"] != "queued":
+                raise HTTPException(status_code=400, detail="Só é possível cancelar solicitações na fila")
+            await conn.execute(
+                "UPDATE loans SET status = 'cancelled' WHERE id = $1", uuid.UUID(loan_id),
+            )
+            await _recalc_queue_positions(conn, loan["equipment_id"])
+            final = await conn.fetchrow("SELECT * FROM loans WHERE id = $1", uuid.UUID(loan_id))
+    return LoanOut(**row_to_dict(final))
 
 
 @api_router.get("/loans/all", response_model=List[LoanOut])
 async def all_loans(admin: dict = Depends(require_admin)):
-    items = await db.loans.find({}, {"_id": 0}).sort("requested_at", -1).to_list(1000)
-    return [LoanOut(**i) for i in items]
+    p = await get_pool()
+    async with p.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM loans ORDER BY requested_at DESC")
+    return [LoanOut(**row_to_dict(r)) for r in rows]
 
 
 # -----------------------
-# Stats (for landing/hero animations)
+# Stats
 # -----------------------
 @api_router.get("/stats")
 async def stats():
-    total_eq = await db.equipment.count_documents({})
-    active_loans = await db.loans.count_documents({"status": "active"})
-    queued = await db.loans.count_documents({"status": "queued"})
-    users = await db.users.count_documents({})
+    p = await get_pool()
+    async with p.acquire() as conn:
+        total_eq = await conn.fetchval("SELECT COUNT(*) FROM equipment")
+        active = await conn.fetchval("SELECT COUNT(*) FROM loans WHERE status = 'active'")
+        queued = await conn.fetchval("SELECT COUNT(*) FROM loans WHERE status = 'queued'")
+        users = await conn.fetchval("SELECT COUNT(*) FROM users")
     return {
         "total_equipment": total_eq,
-        "active_loans": active_loans,
+        "active_loans": active,
         "queued_requests": queued,
         "total_users": users,
     }
@@ -452,7 +540,6 @@ async def upload_image(
     folder: str = "equipment",
     user: dict = Depends(get_current_user),
 ):
-    """Upload de imagem para Supabase Storage bucket publico 'imagens'."""
     sup = _supa_admin()
     if sup is None:
         raise HTTPException(status_code=503, detail="Supabase nao configurado")
@@ -478,37 +565,14 @@ async def upload_image(
     return {"public_url": public_url, "path": path, "bucket": bucket}
 
 
-
-
 @api_router.get("/")
 async def root():
-    return {"service": "Fomerstick API", "status": "ok"}
+    return {"service": "Fomerstick API", "db": "Supabase PostgreSQL", "status": "ok"}
 
 
 # -----------------------
 # Seed
 # -----------------------
-async def seed_admin():
-    email = os.environ.get("ADMIN_EMAIL", "admin@fomerstick.com")
-    pwd = os.environ.get("ADMIN_PASSWORD", "admin123")
-    existing = await db.users.find_one({"email": email})
-    if not existing:
-        await db.users.insert_one({
-            "id": str(uuid.uuid4()),
-            "email": email,
-            "name": "Admin Fomerstick",
-            "password_hash": hash_password(pwd),
-            "role": "admin",
-            "created_at": utc_iso(),
-        })
-        logger.info(f"Seeded admin: {email}")
-    elif not verify_password(pwd, existing["password_hash"]):
-        await db.users.update_one(
-            {"email": email},
-            {"$set": {"password_hash": hash_password(pwd), "role": "admin"}},
-        )
-
-
 SEED_EQUIPMENT = [
     {
         "name": "MacBook Pro 16\" M3 Max",
@@ -561,70 +625,79 @@ SEED_EQUIPMENT = [
 ]
 
 
-async def seed_equipment():
-    count = await db.equipment.count_documents({})
+async def seed_admin(conn):
+    email = os.environ.get("ADMIN_EMAIL", "admin@fomerstick.com")
+    pwd = os.environ.get("ADMIN_PASSWORD", "admin123")
+    existing = await conn.fetchrow(
+        "SELECT id, password_hash FROM users WHERE email = $1", email
+    )
+    if not existing:
+        await conn.execute(
+            "INSERT INTO users (email, name, password_hash, role) VALUES ($1, $2, $3, 'admin')",
+            email, "Admin Fomerstick", hash_password(pwd),
+        )
+        logger.info(f"Seeded admin: {email}")
+    elif not verify_password(pwd, existing["password_hash"]):
+        await conn.execute(
+            "UPDATE users SET password_hash = $1, role = 'admin' WHERE email = $2",
+            hash_password(pwd), email,
+        )
+
+
+async def seed_equipment(conn):
+    count = await conn.fetchval("SELECT COUNT(*) FROM equipment")
     if count > 0:
         return
     for item in SEED_EQUIPMENT:
-        doc = {
-            "id": str(uuid.uuid4()),
-            "available_units": item["total_units"],
-            "created_at": utc_iso(),
-            **item,
-        }
-        await db.equipment.insert_one(doc)
+        await conn.execute("""
+            INSERT INTO equipment (name, category, description, image_url, specs, total_units, available_units)
+            VALUES ($1, $2, $3, $4, $5, $6, $6)
+        """, item["name"], item["category"], item["description"],
+             item["image_url"], item["specs"], item["total_units"])
     logger.info(f"Seeded {len(SEED_EQUIPMENT)} equipment items")
 
 
 def ensure_supabase_bucket():
-    """Cria (se não existir) o bucket público de imagens no Supabase Storage."""
-    url = os.environ.get("SUPABASE_URL")
-    key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+    sup = _supa_admin()
     bucket = os.environ.get("SUPABASE_BUCKET", "imagens")
-    if not url or not key or _supa_create_client is None:
+    if sup is None:
         logger.info("Supabase nao configurado - pulando criacao de bucket")
         return
     try:
-        sclient = _supa_create_client(url, key)
-        buckets = sclient.storage.list_buckets()
+        buckets = sup.storage.list_buckets()
         names = []
         for b in buckets:
-            n = getattr(b, "name", None)
-            if n is None and isinstance(b, dict):
-                n = b.get("name")
+            n = getattr(b, "name", None) or (b.get("name") if isinstance(b, dict) else None)
             if n:
                 names.append(n)
         if bucket in names:
             logger.info(f"Supabase bucket '{bucket}' ja existe")
             return
-        sclient.storage.create_bucket(
-            bucket,
-            options={"public": True, "file_size_limit": 5 * 1024 * 1024},
+        sup.storage.create_bucket(
+            bucket, options={"public": True, "file_size_limit": 5 * 1024 * 1024},
         )
         logger.info(f"Supabase bucket '{bucket}' criado (publico)")
     except Exception as e:
         logger.warning(f"Supabase bucket setup falhou: {e}")
 
 
-
 @app.on_event("startup")
 async def on_startup():
-    try:
-        await db.users.create_index("email", unique=True)
-        await db.users.create_index("id", unique=True)
-        await db.equipment.create_index("id", unique=True)
-        await db.loans.create_index("id", unique=True)
-        await db.loans.create_index([("equipment_id", 1), ("status", 1)])
-    except Exception as e:
-        logger.warning(f"Index creation issue: {e}")
-    await seed_admin()
-    await seed_equipment()
+    p = await get_pool()
+    async with p.acquire() as conn:
+        await conn.execute(SCHEMA_SQL)
+        await seed_admin(conn)
+        await seed_equipment(conn)
     ensure_supabase_bucket()
+    logger.info("Fomerstick API ready (Supabase PostgreSQL)")
 
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    client.close()
+    global pool
+    if pool is not None:
+        await pool.close()
+        pool = None
 
 
 app.include_router(api_router)
